@@ -4,7 +4,7 @@ use log::debug;
 
 use anyhow::anyhow;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::config::CONFIG;
 use crate::detector::gtfobins::GTFOBinsDetector;
@@ -15,6 +15,20 @@ use crate::detector::filemon::FileMon;
 use crate::detector::netmon::NetMon;
 use crate::detector::procmon::ProcMon;
 use crate::detector::Detector;
+
+macro_rules! load_detector {
+    ($detectors:expr, $name:expr, $obj:expr, $config:expr, $(($key:expr, $type:ty)),+) => {
+        match $name {
+            $($key => {
+                let mut detector = <$type>::new($obj, $config).await?;
+                detector.load()?;
+                $detectors.insert($name.to_string(), Box::new(detector));
+                Ok(())
+            },)+
+            _ => Err(anyhow!("{} unknown detector", $name))
+        }
+    };
+}
 
 pub struct Registry {
     /// Loader Detectors
@@ -39,44 +53,35 @@ impl Registry {
         for name in names.iter().map(|e| e.as_str()) {
             obj_path.push(name);
             config_path.push(name.to_owned() + ".yaml");
-            match name {
-                "gtfobins" => {
-                    let mut detector = GTFOBinsDetector::new(&obj_path, Some(&config_path)).await?;
-                    detector.load()?;
-                    self.detectors.insert(name.to_string(), Box::new(detector));
-                }
-                "histfile" => {
-                    let mut detector = HistFileDetector::new(&obj_path, None).await?;
-                    detector.load()?;
-                    self.detectors.insert(name.to_string(), Box::new(detector));
-                }
-                "io_uring" => {
-                    let mut detector = IOUringDetector::new(&obj_path, None).await?;
-                    detector.load()?;
-                    self.detectors.insert(name.to_string(), Box::new(detector));
-                }
-                "procmon" => {
-                    let mut procmon = ProcMon::new(&obj_path, Some(&config_path)).await?;
-                    procmon.load()?;
-                    self.detectors.insert(name.to_string(), Box::new(procmon));
-                }
-                "filemon" => {
-                    let mut filemon = FileMon::new(&obj_path, Some(&config_path)).await?;
-                    filemon.load()?;
-                    self.detectors.insert(name.to_string(), Box::new(filemon));
-                }
-                "netmon" => {
-                    let mut netmon = NetMon::new(&obj_path, Some(&config_path)).await?;
-                    netmon.load()?;
-                    self.detectors.insert(name.to_string(), Box::new(netmon));
-                }
-                _ => return Err(anyhow!("{} unknown detector", name)),
-            };
-
-            debug!("Detector {name} is loaded");
+            let yaml_config = std::fs::read_to_string(&config_path).ok();
+            self.load_detector(name, &obj_path, yaml_config).await?;
             obj_path.pop();
             config_path.pop();
         }
+        Ok(())
+    }
+
+    pub async fn load_detector(
+        &mut self,
+        name: &str,
+        obj_path: &Path,
+        yaml_config: Option<String>,
+    ) -> Result<(), anyhow::Error> {
+        load_detector!(
+            &mut self.detectors,
+            name,
+            obj_path,
+            yaml_config,
+            /* List of supported Detecotors */
+            ("procmon", ProcMon),
+            ("filemon", FileMon),
+            ("netmon", NetMon),
+            ("gtfobins", GTFOBinsDetector),
+            ("histfile", HistFileDetector),
+            ("io_uring", IOUringDetector)
+        )?;
+
+        debug!("Detector {name} is loaded");
         Ok(())
     }
 }
