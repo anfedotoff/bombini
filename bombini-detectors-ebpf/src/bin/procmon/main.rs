@@ -9,7 +9,10 @@ use aya_ebpf::{
         bpf_probe_read_user_str_bytes,
     },
     macros::{btf_tracepoint, fentry, lsm, map},
-    maps::{array::Array, hash_map::HashMap, hash_map::LruHashMap, per_cpu_array::PerCpuArray},
+    maps::{
+        array::Array, hash_map::HashMap, hash_map::LruHashMap, lpm_trie::LpmTrie,
+        per_cpu_array::PerCpuArray,
+    },
     programs::{BtfTracePointContext, FEntryContext, LsmContext},
 };
 
@@ -19,10 +22,13 @@ use bombini_detectors_ebpf::vmlinux::{
 };
 
 use bombini_common::config::procmon::Config;
-use bombini_common::event::process::{ProcInfo, SecureExec, MAX_ARGS_SIZE, MAX_FILE_PATH};
+use bombini_common::constants::{MAX_ARGS_SIZE, MAX_FILENAME_SIZE, MAX_FILE_PATH, MAX_FILE_PREFIX};
+use bombini_common::event::process::{ProcInfo, SecureExec};
 use bombini_common::event::{Event, MSG_PROCEXEC, MSG_PROCEXIT};
 
-use bombini_detectors_ebpf::{event_capture, event_map::rb_event_init, util};
+use bombini_detectors_ebpf::{
+    event_capture, event_map::rb_event_init, filter::process::ProcessFilter, util,
+};
 
 /// Extra info from bprm_committing_creds hook
 struct CredSharedInfo {
@@ -47,6 +53,29 @@ static PROCMON_HEAP: PerCpuArray<ProcInfo> = PerCpuArray::with_max_entries(1, 0)
 
 #[map]
 static PROCMON_CONFIG: Array<Config> = Array::with_max_entries(1, 0);
+
+// Filter maps
+
+#[map]
+static PROCMON_FILTER_UID_MAP: HashMap<u32, u8> = HashMap::with_max_entries(1, 0);
+
+#[map]
+static PROCMON_FILTER_EUID_MAP: HashMap<u32, u8> = HashMap::with_max_entries(1, 0);
+
+#[map]
+static PROCMON_FILTER_AUID_MAP: HashMap<u32, u8> = HashMap::with_max_entries(1, 0);
+
+#[map]
+static PROCMON_FILTER_BINPATH_MAP: HashMap<[u8; MAX_FILE_PATH], u8> =
+    HashMap::with_max_entries(1, 0);
+
+#[map]
+static PROCMON_FILTER_BINNAME_MAP: HashMap<[u8; MAX_FILENAME_SIZE], u8> =
+    HashMap::with_max_entries(1, 0);
+
+#[map]
+static PROCMON_FILTER_BINPREFIX_MAP: LpmTrie<[u8; MAX_FILE_PREFIX], u8> =
+    LpmTrie::with_max_entries(1, 0);
 
 #[inline(always)]
 unsafe fn get_creds(proc: &mut ProcInfo, task: *const task_struct) -> Result<u32, u32> {
@@ -77,17 +106,17 @@ fn is_cap_gained(new: u64, old: u64) -> bool {
 
 #[btf_tracepoint(function = "sched_process_exec")]
 pub fn execve_capture(ctx: BtfTracePointContext) -> u32 {
+    event_capture!(ctx, MSG_PROCEXEC, false, try_execve)
+}
+
+fn try_execve(_ctx: BtfTracePointContext, event: &mut Event) -> Result<u32, u32> {
     let Some(config_ptr) = PROCMON_CONFIG.get_ptr(0) else {
-        return 0;
+        return Err(0);
     };
     let config = unsafe { config_ptr.as_ref() };
     let Some(config) = config else {
-        return 0;
+        return Err(0);
     };
-    event_capture!(ctx, MSG_PROCEXEC, false, try_execve, config.expose_events)
-}
-
-fn try_execve(_ctx: BtfTracePointContext, event: &mut Event, expose: bool) -> Result<u32, u32> {
     let Event::ProcExec(event) = event else {
         return Err(0);
     };
@@ -178,40 +207,81 @@ fn try_execve(_ctx: BtfTracePointContext, event: &mut Event, expose: bool) -> Re
     }
 
     proc.clonned = false;
-    // Copy process info to Rb
-    if expose {
+    if config.expose_events {
+        if !config.filter_mask.is_empty() {
+            let process_filter: ProcessFilter = ProcessFilter::new(
+                &PROCMON_FILTER_UID_MAP,
+                &PROCMON_FILTER_EUID_MAP,
+                &PROCMON_FILTER_AUID_MAP,
+                &PROCMON_FILTER_BINNAME_MAP,
+                &PROCMON_FILTER_BINPATH_MAP,
+                &PROCMON_FILTER_BINPREFIX_MAP,
+            );
+            let mut allow = process_filter.filter(config.filter_mask, proc);
+            if config.deny_list {
+                allow = !allow;
+            }
+            if allow {
+                util::copy_proc(proc, event);
+                return Ok(0);
+            }
+            return Err(0);
+        }
         util::copy_proc(proc, event);
+        return Ok(0);
     }
-
-    Ok(0)
+    Err(0)
 }
 
 #[fentry(function = "acct_process")]
 pub fn exit_capture(ctx: FEntryContext) -> u32 {
+    event_capture!(ctx, MSG_PROCEXIT, false, try_exit)
+}
+
+fn try_exit(_ctx: FEntryContext, event: &mut Event) -> Result<u32, u32> {
     let Some(config_ptr) = PROCMON_CONFIG.get_ptr(0) else {
-        return 0;
+        return Err(0);
     };
     let config = unsafe { config_ptr.as_ref() };
     let Some(config) = config else {
-        return 0;
+        return Err(0);
     };
-    event_capture!(ctx, MSG_PROCEXIT, false, try_exit, config.expose_events)
-}
-
-fn try_exit(_ctx: FEntryContext, event: &mut Event, expose: bool) -> Result<u32, u32> {
     let Event::ProcExit(event) = event else {
         return Err(0);
     };
     let pid = (bpf_get_current_pid_tgid() >> 32) as u32;
-    if expose {
-        let proc = unsafe { PROCMON_PROC_MAP.get(&pid) };
-        let Some(proc) = proc else {
+    let proc = unsafe { PROCMON_PROC_MAP.get(&pid) };
+    let Some(proc) = proc else {
+        return Err(0);
+    };
+    if config.expose_events {
+        if !config.filter_mask.is_empty() {
+            let process_filter: ProcessFilter = ProcessFilter::new(
+                &PROCMON_FILTER_UID_MAP,
+                &PROCMON_FILTER_EUID_MAP,
+                &PROCMON_FILTER_AUID_MAP,
+                &PROCMON_FILTER_BINNAME_MAP,
+                &PROCMON_FILTER_BINPATH_MAP,
+                &PROCMON_FILTER_BINPREFIX_MAP,
+            );
+            let mut allow = process_filter.filter(config.filter_mask, proc);
+            if config.deny_list {
+                allow = !allow;
+            }
+            if allow {
+                util::copy_proc(proc, event);
+                PROCMON_PROC_MAP.remove(&pid).unwrap();
+                return Ok(0);
+            }
+            PROCMON_PROC_MAP.remove(&pid).unwrap();
             return Err(0);
-        };
+        }
         util::copy_proc(proc, event);
+        PROCMON_PROC_MAP.remove(&pid).unwrap();
+        return Ok(0);
     }
     PROCMON_PROC_MAP.remove(&pid).unwrap();
-    Ok(0)
+    Err(0)
 }
 
 #[lsm(hook = "bprm_committing_creds")]
